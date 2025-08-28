@@ -79,15 +79,17 @@ def qed_smiles(smiles, num_workers=6):
 def ExactMolWt_smiles(smiles, num_workers=6):
     return [ExactMolWt_mols_(Chem.MolFromSmiles(smile)) for smile in smiles]
 
-def MAE_properties(mols, properties, properties_idx=[0,1,2]): # molwt, LogP, QED
+def MAE_properties(mols, properties, properties_idx=[0,1,2], return_properties=False): # molwt, LogP, QED
 
     gen_properties = None
 
+    gen_molwt = None
     if 0 in properties_idx:
         gen_molwt = ExactMolWt_mols(mols)
         gen_molwt = torch.tensor(gen_molwt).to(dtype=properties.dtype, device=properties.device).unsqueeze(1)
         gen_properties = gen_molwt
 
+    gen_logp = None
     if 1 in properties_idx:
         gen_logp = MolLogP_mols(mols)
         gen_logp = torch.tensor(gen_logp).to(dtype=properties.dtype, device=properties.device).unsqueeze(1)
@@ -96,6 +98,7 @@ def MAE_properties(mols, properties, properties_idx=[0,1,2]): # molwt, LogP, QED
         else:
             gen_properties = torch.cat([gen_properties, gen_logp], dim=1)
 
+    gen_qed = None
     if 2 in properties_idx:
         gen_qed = qed_mols(mols)
         gen_qed = torch.tensor(gen_qed).to(dtype=properties.dtype, device=properties.device).unsqueeze(1)
@@ -112,11 +115,14 @@ def MAE_properties(mols, properties, properties_idx=[0,1,2]): # molwt, LogP, QED
     if n < 100:
         print(f'Warning: Less than 100 valid molecules ({n} valid molecules), so results will be poor')
     Min_MAE = losses_1[0]
-    print(Chem.MolToSmiles(mols[index_best])) # best molecule
+    print('best mol', Chem.MolToSmiles(mols[index_best])) # best molecule
     Min10_MAE = torch.sum(losses_10)/10
     Min100_MAE = torch.sum(losses_100)/100
-    
-    return Min_MAE, Min10_MAE, Min100_MAE
+
+    if return_properties:
+        return Min_MAE, Min10_MAE, Min100_MAE, gen_molwt, gen_logp, gen_qed
+    else:
+        return Min_MAE, Min10_MAE, Min100_MAE
 
 
 # From https://arxiv.org/pdf/2210.12765

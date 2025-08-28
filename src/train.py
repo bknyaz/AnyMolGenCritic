@@ -1,31 +1,34 @@
+"""
+Training on ZINC was done with:
+python train.py --dataset_name zinc --num_layers 3 --tag exp_zinc50epoch --bf16 --check_sample_every_n_epoch 999 --dropout 0.0 --warmup_steps 100 \
+ --lr_decay 0.1 --beta2 0.95 --weight_decay 0.1 --lambda_predict_prop 1.0 --batch_size 512 --lr 1e-3 --max_epochs 50 --n_gpu 1 --randomize_order \
+ --start_random --scaling_type std --special_init --nhead 16 --swiglu --expand_scale 2.0 --max_len 250 --gpt --no_bias --rmsnorm --rotary \
+ --not_allow_empty_bond --save_checkpoint_dir ./checkpoints/ --log_every_n_steps 24
+
+"""
+
+
 import os
-import sys
 import argparse
-from numpy.lib.arraysetops import unique
 from rdkit import Chem
-import random
 import torch
-import copy
 from torch.utils.data import DataLoader
-import shutil
 
 import torch.distributed as dist
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import NeptuneLogger
-from pytorch_lightning.utilities import rank_zero_only
 import moses
 from moses.utils import disable_rdkit_log, enable_rdkit_log
 from data.target_data import Data as TargetData
-from torch.distributions.bernoulli import Bernoulli
 
 from model.generator import CondGenerator
 from data.dataset import get_cond_datasets, DummyDataset, merge_datasets
-from props.properties import penalized_logp, MAE_properties, best_rewards_gflownet
+from props.properties import MAE_properties, best_rewards_gflownet
 from util import compute_sequence_cross_entropy, compute_property_accuracy, compute_sequence_accuracy, canonicalize
 from evaluate.MCD.evaluator import TaskModel, compute_molecular_metrics
 from moses.metrics.metrics import compute_intermediate_statistics
-from joblib import dump, load
+from joblib import load
 import numpy as np
 
 class CondGeneratorLightningModule(pl.LightningModule):
@@ -291,22 +294,31 @@ class CondGeneratorLightningModule(pl.LightningModule):
                     self.check_samples() # cond on train properties
 
     # Sample extreme values for each properties and evaluate the OOD generated molecules 
-    def check_samples_ood(self):
-        assert self.hparams.num_samples_ood % self.hparams.n_gpu == 0
-        num_samples = self.hparams.num_samples_ood // self.hparams.n_gpu if not self.trainer.sanity_checking else 2
-        assert len(self.hparams.ood_values) == 1 or len(self.hparams.ood_values) == 2*self.train_dataset.n_properties
+    def check_samples_ood(self, num_samples=None, multi_prop=False, return_results=False):
+        if num_samples is None:
+            assert self.hparams.num_samples_ood % self.hparams.n_gpu == 0, (self.hparams.num_samples_ood, self.hparams.n_gpu)
+            num_samples = self.hparams.num_samples_ood // self.hparams.n_gpu if not self.trainer.sanity_checking else 2
+            assert len(self.hparams.ood_values) == 1 or len(self.hparams.ood_values) == 2*self.train_dataset.n_properties
         i_ = 0
-        
-        for idx in range(self.train_dataset.n_properties):
-            for j in range(2): #
+
+        if multi_prop:
+            assert len(self.hparams.ood_values) == self.train_dataset.n_properties, \
+                (f'must specify {self.train_dataset.n_properties} property values (e.g. molw, logp, qed) to satisfy at the same time '
+                 f'instead of {self.hparams.ood_values}')
+
+        for idx in range(1 if multi_prop else self.train_dataset.n_properties):
+            for j in range(1 if multi_prop else 2): #
                 if j == 0: # u + std
                     stats_name = f"sample_ood_{idx}_mean_plus_std"
                     if len(self.hparams.ood_values) <= 1:
                         properties_np = self.train_dataset.get_mean_plus_std_property(idx, std=4)
                         print(f'raw_prop: {self.train_dataset.scaler_properties.inverse_transform(properties_np)[0]}')
                     else:
-                        properties_np = np.zeros((1, self.train_dataset.n_properties))
-                        properties_np[:, idx] = self.hparams.ood_values[i_]
+                        if multi_prop:
+                            properties_np = np.array(self.hparams.ood_values).reshape(1, -1)
+                        else:
+                            properties_np = np.zeros((1, self.train_dataset.n_properties))
+                            properties_np[:, idx] = self.hparams.ood_values[i_]
                         print(f'raw_prop: {properties_np[0]}')
                         if self.train_dataset.scaler_properties is not None:
                             properties_np = self.train_dataset.scaler_properties.transform(properties_np) # raw to whatever
@@ -324,10 +336,10 @@ class CondGeneratorLightningModule(pl.LightningModule):
                             properties_np = self.train_dataset.scaler_properties.transform(properties_np) # raw to whatever
                         i_ += 1
                 print(f'std_prop: {properties_np[0]}')
-                print(stats_name)
+                print('stats_name', stats_name)
                 properties_np = np.repeat(properties_np, num_samples, axis=0)
                 local_properties = torch.tensor(properties_np).to(device=self.device, dtype=torch.float32)
-                mask_cond = [i != idx for i in range(self.train_dataset.n_properties)] # we only give the single property we care about to the model; the model can figure out the rest
+                mask_cond = [multi_prop or i != idx for i in range(self.train_dataset.n_properties)] # we only give the single property we care about to the model; the model can figure out the rest
                 local_smiles_list, results, _ = self.sample_cond(local_properties, num_samples, temperature=self.hparams.temperature_ood, 
                     guidance=self.hparams.guidance_ood, guidance_rand=self.hparams.guidance_rand, mask_cond=mask_cond)
                 #print('smiles')
@@ -375,15 +387,30 @@ class CondGeneratorLightningModule(pl.LightningModule):
                     properties_unscaled = torch.tensor(self.train_dataset.scaler_properties.inverse_transform(properties[idx_valid].cpu().numpy())).to(device=self.device, dtype=properties.dtype)
                 else:
                     properties_unscaled = properties[idx_valid]
-                print(properties_unscaled[0])
-                statistics[f"{stats_name}/Min_MAE"], statistics[f"{stats_name}/Min10_MAE"], statistics[f"{stats_name}/Min100_MAE"] = MAE_properties(valid_mols_list, properties=properties_unscaled[:, idx].unsqueeze(1), properties_idx=[idx]) # molwt, LogP, QED
-                print(statistics[f"{stats_name}/valid"])
-                print(statistics[f"{stats_name}/Min_MAE"])
-                print(statistics[f"{stats_name}/Min10_MAE"])
-                print(statistics[f"{stats_name}/Min100_MAE"])
+                print('properties_unscaled', properties_unscaled[0])
+                if return_results:
+                    statistics[f"{stats_name}/Min_MAE"], statistics[f"{stats_name}/Min10_MAE"], statistics[
+                        f"{stats_name}/Min100_MAE"], gen_molwt, gen_logp, gen_qed = MAE_properties(
+                        valid_mols_list, properties=properties_unscaled[:, idx].unsqueeze(1),
+                        properties_idx=list(np.arange(self.train_dataset.n_properties)) if multi_prop else [
+                            idx], return_properties=True)  # molwt, LogP, QED
+                else:
+                    statistics[f"{stats_name}/Min_MAE"], statistics[f"{stats_name}/Min10_MAE"], statistics[f"{stats_name}/Min100_MAE"] = MAE_properties(
+                        valid_mols_list, properties=properties_unscaled[:, idx].unsqueeze(1),
+                        properties_idx=list(np.arange(self.train_dataset.n_properties)) if multi_prop else [idx]) # molwt, LogP, QED
+                print('valid', statistics[f"{stats_name}/valid"])
+                print('Min_MAE', statistics[f"{stats_name}/Min_MAE"])
+                print('Min10_MAE', statistics[f"{stats_name}/Min10_MAE"])
+                print('Min100_MAE', statistics[f"{stats_name}/Min100_MAE"])
+
                 for key, val in statistics.items():
                     self.log(key, val, on_step=False, on_epoch=True, logger=True, sync_dist=self.hparams.n_gpu > 1)
-            
+
+        if return_results:
+            return smiles_list, valid_mols_list, list(unique_smiles_set), gen_molwt, gen_logp, gen_qed
+        return None
+
+
     # Sample conditional on a property
     def sample_cond(self, properties, num_samples, guidance, guidance_rand, temperature, mask_cond=None):
         print("Sample_cond")
@@ -395,7 +422,9 @@ class CondGeneratorLightningModule(pl.LightningModule):
             cur_num_samples = min(num_samples - offset, self.hparams.sample_batch_size)
             batched_cond_data = properties[offset:(offset+cur_num_samples), :]
             offset += cur_num_samples
-            print(offset)
+            print('offset', offset,
+                  batched_cond_data.shape, batched_cond_data if offset == 10 else '',
+                  len(mask_cond), mask_cond if offset == 10 else '')
             data_list, loss_prop_ = self.model.decode(batched_cond_data, max_len=self.hparams.max_len, device=self.device, mask_cond=mask_cond,
                 temperature=temperature, guidance=guidance, guidance_rand=guidance_rand,
                 top_k=self.hparams.top_k, best_out_of_k=self.hparams.best_out_of_k,
@@ -862,8 +891,8 @@ if __name__ == "__main__":
     parser.add_argument("--log_every_n_steps", type=int, default=50)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--load_checkpoint_path", type=str, default="")
-    parser.add_argument("--save_checkpoint_dir", type=str, default="/network/scratch/j/jolicoea/AutoregressiveMolecules_checkpoints")
-    parser.add_argument("--tag", type=str, default="default")
+    parser.add_argument("--save_checkpoint_dir", type=str, default="./checkpoints")
+    parser.add_argument("--tag", type=str, default="exp")
     parser.add_argument("--test", action="store_true")
     hparams = parser.parse_args()
 
