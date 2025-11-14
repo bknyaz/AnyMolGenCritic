@@ -463,11 +463,12 @@ class CondGenerator(BaseGenerator):
                     loss_prop += bce_loss(prop_pred_all[:, i], batched_cond_data[:, i])
         else:
             loss_prop = None
+            prop_pred_all = None
 
         for i in range(num_samples):
             assert data_list_all[i].tracker_id == i
 
-        return data_list_all, ended_all, loss_prop
+        return data_list_all, ended_all, loss_prop, prop_pred_all
 
     @torch.no_grad()
     def decode(self, batched_cond_data, max_len, device, temperature=1.0, guidance=1.0, guidance_rand=False, top_k=0, 
@@ -475,16 +476,18 @@ class CondGenerator(BaseGenerator):
         num_samples = batched_cond_data.size(0)
         
         loss_prop = None
-        data_list, ended, loss_prop = self.decode_(batched_cond_data=batched_cond_data, 
+        data_list, ended, loss_prop, prop_pred_all = self.decode_(batched_cond_data=batched_cond_data,
             max_len=max_len, device=device, temperature=temperature, guidance=guidance, guidance_rand=guidance_rand, top_k=top_k, 
             mask_cond=mask_cond, track_property_closeness=(best_out_of_k > 1 and predict_prop) or return_loss_prop,
             allow_empty_bond=allow_empty_bond)
 
+        print('mask_cond', mask_cond, 'guidance', guidance, 'best_out_of_k', best_out_of_k, 'predict_prop', predict_prop,
+              'guidance_rand', guidance_rand, 'top_k', top_k, 'temperature', temperature)
         # Do a Best-out-of-K based on the predicted properties
         for i in range(1, best_out_of_k):
             if not predict_prop and np.array(ended).int().sum() == len(ended):
                 break # if all completed and we have no property-prediction, we end early
-            data_list_, ended_, loss_prop_ = self.decode_(batched_cond_data=batched_cond_data, 
+            data_list_, ended_, loss_prop_, prop_pred_all_ = self.decode_(batched_cond_data=batched_cond_data,
                 max_len=max_len, device=device, temperature=temperature, guidance=guidance, guidance_rand=guidance_rand, top_k=top_k, 
                 mask_cond=mask_cond, track_property_closeness=best_out_of_k > 1 and predict_prop,
                 allow_empty_bond=allow_empty_bond)
@@ -499,5 +502,5 @@ class CondGenerator(BaseGenerator):
                     if not ended[i] and ended_[i]:
                         data_list[i] = data_list_[i]
 
-        return data_list, loss_prop
+        return data_list, loss_prop, prop_pred_all
 

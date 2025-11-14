@@ -339,8 +339,10 @@ class CondGeneratorLightningModule(pl.LightningModule):
                 print('stats_name', stats_name)
                 properties_np = np.repeat(properties_np, num_samples, axis=0)
                 local_properties = torch.tensor(properties_np).to(device=self.device, dtype=torch.float32)
-                mask_cond = [multi_prop or i != idx for i in range(self.train_dataset.n_properties)] # we only give the single property we care about to the model; the model can figure out the rest
-                local_smiles_list, results, _ = self.sample_cond(local_properties, num_samples, temperature=self.hparams.temperature_ood, 
+                mask_cond = [ (not multi_prop) and i != idx for i in range(self.train_dataset.n_properties)] # we only give the single property we care about to the model; the model can figure out the rest
+                local_smiles_list, results, loss_prop, prop_pred_all = self.sample_cond(local_properties,
+                                                                                        num_samples,
+                                                                                        temperature=self.hparams.temperature_ood,
                     guidance=self.hparams.guidance_ood, guidance_rand=self.hparams.guidance_rand, mask_cond=mask_cond)
                 #print('smiles')
                 #print(local_smiles_list[0:5])
@@ -385,9 +387,12 @@ class CondGeneratorLightningModule(pl.LightningModule):
                 statistics[f"{stats_name}/efficient"] = float(len(efficient_smiles_list)) / self.hparams.num_samples_ood
                 if self.train_dataset.scaler_properties is not None:
                     properties_unscaled = torch.tensor(self.train_dataset.scaler_properties.inverse_transform(properties[idx_valid].cpu().numpy())).to(device=self.device, dtype=properties.dtype)
+                    prop_pred_all = torch.tensor(self.train_dataset.scaler_properties.inverse_transform(prop_pred_all[idx_valid].cpu().numpy())).to(device=self.device, dtype=properties.dtype)
                 else:
                     properties_unscaled = properties[idx_valid]
-                print('properties_unscaled', properties_unscaled[0])
+                    prop_pred_all = prop_pred_all[idx_valid]
+                print('properties_unscaled', properties_unscaled.shape, properties_unscaled[0])
+                print('prop_pred_all unscaled', prop_pred_all.shape, prop_pred_all)
                 if return_results:
                     statistics[f"{stats_name}/Min_MAE"], statistics[f"{stats_name}/Min10_MAE"], statistics[
                         f"{stats_name}/Min100_MAE"], gen_molwt, gen_logp, gen_qed = MAE_properties(
@@ -407,7 +412,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
                     self.log(key, val, on_step=False, on_epoch=True, logger=True, sync_dist=self.hparams.n_gpu > 1)
 
         if return_results:
-            return smiles_list, valid_mols_list, list(unique_smiles_set), gen_molwt, gen_logp, gen_qed
+            return smiles_list, valid_mols_list, list(unique_smiles_set), gen_molwt, gen_logp, gen_qed, prop_pred_all
         return None
 
 
@@ -417,6 +422,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
         offset = 0
         results = []
         loss_prop = []
+        prop_pred_all = []
         self.model.eval()
         while offset < num_samples:
             cur_num_samples = min(num_samples - offset, self.hparams.sample_batch_size)
@@ -425,22 +431,27 @@ class CondGeneratorLightningModule(pl.LightningModule):
             print('offset', offset,
                   batched_cond_data.shape, batched_cond_data if offset == 10 else '',
                   len(mask_cond), mask_cond if offset == 10 else '')
-            data_list, loss_prop_ = self.model.decode(batched_cond_data, max_len=self.hparams.max_len, device=self.device, mask_cond=mask_cond,
+            data_list, loss_prop_, prop_pred_all_ = self.model.decode(batched_cond_data, max_len=self.hparams.max_len,
+                                                                      device=self.device, mask_cond=mask_cond,
                 temperature=temperature, guidance=guidance, guidance_rand=guidance_rand,
                 top_k=self.hparams.top_k, best_out_of_k=self.hparams.best_out_of_k,
                 predict_prop=self.hparams.lambda_predict_prop > 0, return_loss_prop=self.hparams.lambda_predict_prop > 0,
                 allow_empty_bond=not self.hparams.not_allow_empty_bond,)
             if loss_prop_ is not None:
                 loss_prop += [loss_prop_]
+            if prop_pred_all_ is not None:
+                prop_pred_all += [prop_pred_all_]
             results.extend((data.to_smiles(), "".join(data.tokens), data.error) for data in data_list)
         if loss_prop_ is not None:
             loss_prop = torch.cat(loss_prop, dim=0)
+        if prop_pred_all_ is not None:
+            prop_pred_all = torch.cat(prop_pred_all, dim=0)
         self.model.train()
         disable_rdkit_log()
         smiles_list = [canonicalize(elem[0]) for elem in results]
         enable_rdkit_log()
 
-        return smiles_list, results, loss_prop
+        return smiles_list, results, loss_prop, prop_pred_all
 
     # Generate molecules conditional on random properties from the test dataset
     def sample(self, num_samples):
@@ -666,7 +677,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
             print(properties_np)
         properties_np = np.repeat(properties_np, num_samples, axis=0)
         local_properties = torch.tensor(properties_np).to(device=self.device, dtype=torch.float32)
-        local_smiles_list, results, _ = self.sample_cond(local_properties, num_samples, 
+        local_smiles_list, results, loss_prop, prop_pred_all = self.sample_cond(local_properties, num_samples,
             temperature=self.hparams.temperature, guidance=self.hparams.guidance, guidance_rand=self.hparams.guidance_rand, mask_cond=None)
         #print('smiles')
         #print(local_smiles_list[0:5])

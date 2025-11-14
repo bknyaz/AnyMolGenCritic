@@ -83,7 +83,7 @@ if __name__ == '__main__':
         # not tested
         model = torch.compile(model)
     pl.seed_everything(hparams.seed, workers=True) # different seed per worker
-    smiles_list, valid_mols_list, unique_smiles_set, gen_molwt, gen_logp, gen_qed = model.check_samples_ood(
+    smiles_list, valid_mols_list, unique_smiles_set, gen_molwt, gen_logp, gen_qed, prop_pred_all = model.check_samples_ood(
         num_samples=hparams.num_samples,
         multi_prop=True,
         return_results=True)
@@ -91,10 +91,12 @@ if __name__ == '__main__':
 
     # dump to csv
     with open(hparams.csv_file, 'w') as f:
-        f.write('smiles,molwt,logp,qed\n')
+        f.write('smiles,molwt,logp,qed,pred_molwt,pred_logp,pred_qed\n')
         for i in range(len(valid_mols_list)):
             smiles = Chem.MolToSmiles(valid_mols_list[i])
-            print(i, smiles, gen_molwt[i].item(), gen_logp[i].item(), gen_qed[i].item())
-            f.write(f'{smiles},{gen_molwt[i].item()},{gen_logp[i].item()},{gen_qed[i].item()}\n')
+            print(i, smiles, gen_molwt[i].item(), gen_logp[i].item(), gen_qed[i].item(),
+                  prop_pred_all[i, 0].item(), prop_pred_all[i, 1].item(), prop_pred_all[i, 2].item())
+            f.write(f'{smiles},{gen_molwt[i].item()},{gen_logp[i].item()},{gen_qed[i].item()},'
+                    f'{prop_pred_all[i, 0].item()},{prop_pred_all[i, 1].item()},{prop_pred_all[i, 2].item()}\n')
 
     print('done')

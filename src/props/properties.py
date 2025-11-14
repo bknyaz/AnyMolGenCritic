@@ -12,7 +12,6 @@ import props.sascorer as sascorer
 from moses.utils import mapper
 import torch_geometric.data as gd
 from rdkit.rdBase import BlockLogs
-from model import mxmnet
 import numpy as np
 
 def similarity(a, b):
@@ -137,6 +136,8 @@ def compute_other_flat_rewards(mol):
 def compute_flat_rewards(mols, device, gap_model=None):
     assert len(mols) <= 128
 
+    from model import mxmnet
+
     if gap_model is None:
         gap_model = mxmnet.MXMNet(mxmnet.Config(128, 6, 5.0))
         state_dict = torch.load('../resource/data/mxmnet_gap_model.pt')
@@ -185,6 +186,8 @@ def top_k_diversity(mols, rewards, K=10):
     return (np.sum(s) - len(x)) / (len(x) * len(x) - len(x))  # substract the diagonal
 
 def best_rewards_gflownet(smiles, mols, device): # molwt, LogP, QED
+
+    from model import mxmnet
 
     gap_model = mxmnet.MXMNet(mxmnet.Config(128, 6, 5.0))
     state_dict = torch.load('../resource/data/mxmnet_gap_model.pt')
